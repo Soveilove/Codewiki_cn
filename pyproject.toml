@@ -1,0 +1,169 @@
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codewiki"
+version = "2.0.0"
+description = "Transform codebases into comprehensive documentation using AI-powered analysis"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "CodeWiki Contributors"}
+]
+keywords = ["documentation", "code-analysis", "ai", "llm", "developer-tools"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "click>=8.1.0",
+    "keyring>=24.0.0",
+    "GitPython>=3.1.40",
+    "Jinja2>=3.1.6",
+    "tree-sitter>=0.23.2",
+    "tree-sitter-language-pack>=0.8.0,<0.9.0",
+    "tree-sitter-python>=0.23.6",
+    "tree-sitter-java>=0.23.5",
+    "tree-sitter-javascript>=0.21.4",
+    "tree-sitter-typescript>=0.21.2",
+    "tree-sitter-c>=0.21.4",
+    "tree-sitter-cpp>=0.23.4",
+    "tree-sitter-c-sharp>=0.23.1",
+    "tree-sitter-php>=0.23.0",
+    "tree-sitter-kotlin>=1.1.0",
+    "tree-sitter-ruby>=0.23.1",
+    "tree-sitter-scala>=0.23.2,<0.24.0",
+    "tree-sitter-rust>=0.23.2,<0.24.0",
+    "openai>=1.107.0",
+    "litellm>=1.77.0",
+    "pydantic>=2.11.7",
+    "pydantic-settings>=2.10.1",
+    "pydantic-ai>=1.0.6",
+    "requests>=2.32.4",
+    "python-dotenv>=1.1.1",
+    "pathspec>=0.12.1",
+    "rich>=14.1.0",
+    "networkx>=3.5",
+    "psutil>=7.0.0",
+    "PyYAML>=6.0.2",
+    "fastapi>=0.116.0",
+    "uvicorn>=0.35.0",
+    "python-multipart>=0.0.20",
+    "colorama>=0.4.6",
+    "logfire>=4.1.0",
+    "coding-agent-wrapper @ git+https://github.com/anhnh2002/caw@fix/codex-exec-robustness",
+    "mcp>=1.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "mypy>=1.5.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+codewiki = "codewiki.cli.main:cli"
+
+[project.urls]
+Homepage = "https://github.com/FSoft-AI4Code/CodeWiki"
+Documentation = "https://github.com/FSoft-AI4Code/CodeWiki/blob/main/guides/README.md"
+Repository = "https://github.com/FSoft-AI4Code/CodeWiki"
+Issues = "https://github.com/FSoft-AI4Code/CodeWiki/issues"
+
+[tool.setuptools]
+packages = [
+    "codewiki", 
+    "codewiki.cli", 
+    "codewiki.cli.commands", 
+    "codewiki.cli.models", 
+    "codewiki.cli.utils", 
+    "codewiki.cli.adapters",
+    "codewiki.src",
+    "codewiki.src.be",
+    "codewiki.src.be.agent_tools",
+    "codewiki.src.be.dependency_analyzer",
+    "codewiki.src.be.dependency_analyzer.analysis",
+    "codewiki.src.be.dependency_analyzer.analyzers",
+    "codewiki.src.be.dependency_analyzer.models",
+    "codewiki.src.be.dependency_analyzer.utils",
+    "codewiki.src.be.updater",
+    "codewiki.src.fe",
+    "codewiki.mcp",
+    "codewiki.mcp.tools"
+]
+
+[tool.setuptools.package-data]
+codewiki = ["templates/**/*", "py.typed", "src/be/*.cjs"]
+
+[tool.black]
+line-length = 100
+target-version = ['py312']
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+mypy_path = "codewiki/src"
+
+[tool.basedpyright]
+# Dev-time checker, kept in step with the lenient [tool.mypy] policy: this
+# repo is not fully type-annotated, so annotation-completeness and
+# inference-noise rule families are disabled. Genuine type errors (optional
+# member access, call issues, unbound variables, ...) stay enabled and are
+# fixed in code.
+extraPaths = ["codewiki/src", "tests"]
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportUnknownLambdaType = "none"
+reportUnknownParameterType = "none"
+reportMissingParameterType = "none"
+reportMissingTypeArgument = "none"
+reportExplicitAny = "none"
+reportAny = "none"
+reportUnannotatedClassAttribute = "none"
+reportUnusedParameter = "none"
+reportUnusedVariable = "none"
+reportUnusedImport = "none"
+reportUnusedCallResult = "none"
+reportImplicitStringConcatenation = "none"
+reportImplicitOverride = "none"
+reportPrivateUsage = "none"
+# The agent_tools <-> backend import cycle is pre-existing architecture that
+# runs fine (deferred imports inside functions); untangling it is a separate
+# refactor, not a type error.
+reportImportCycles = "none"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# ruff 0.16 widened its default rule set considerably; pin the previous
+# defaults so an unpinned `pip install ruff` in CI stays stable.
+# UP (pyupgrade) keeps typing modern on the py312 target: Optional[X]/List[X]
+# and friends are deprecated spellings, not style noise.
+select = ["E4", "E7", "E9", "F", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".venv", "atlascloud", "titan-sight"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-v --cov=codewiki --cov-report=term-missing"

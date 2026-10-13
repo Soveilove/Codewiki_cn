@@ -1,0 +1,615 @@
+"""
+CLI adapter for documentation generator backend.
+
+This adapter wraps the existing backend documentation_generator.py
+and provides CLI-specific functionality like progress reporting.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from codewiki.cli.models.job import DocumentationJob, LLMConfig
+from codewiki.cli.utils.errors import APIError, IncompleteGenerationError
+from codewiki.cli.utils.progress import ProgressTracker
+
+# Import backend modules
+from codewiki.src.be.documentation_generator import DocumentationGenerator
+from codewiki.src.be.doc_layout import list_doc_files
+from codewiki.src.config import DEFAULT_LAYOUT, MAX_DEPTH
+from codewiki.src.config import Config as BackendConfig
+from codewiki.src.config import set_cli_context, set_trace_setting
+from codewiki.src.be.trace import generation_trace, mark_skipped, trace_span, traced
+
+if TYPE_CHECKING:
+    from codewiki.src.be.updater.record import UpdateRecord
+
+
+def _generated_files(working_dir: str) -> list[str]:
+    """Docs-relative paths of the pages and the JSON files in the docs root."""
+    pages = sorted(list_doc_files(working_dir).values())
+    jsons = sorted(f for f in os.listdir(working_dir) if f.endswith(".json"))
+    return pages + jsons
+
+
+class CLIDocumentationGenerator:
+    """
+    CLI adapter for documentation generation with progress reporting.
+
+    This class wraps the backend documentation generator and adds
+    CLI-specific features like progress tracking and error handling.
+    """
+
+    def __init__(
+        self,
+        repo_path: Path,
+        output_dir: Path,
+        config: dict[str, Any],
+        verbose: bool = False,
+        generate_html: bool = False,
+        commit_id: str | None = None,
+    ):
+        """
+        Initialize the CLI documentation generator.
+
+        Args:
+            repo_path: Repository path
+            output_dir: Output directory
+            config: LLM configuration
+            verbose: Enable verbose output
+            generate_html: Whether to generate HTML viewer
+            commit_id: Git commit SHA for incremental update tracking
+        """
+        self.repo_path = repo_path
+        self.output_dir = output_dir
+        # Set later by the update path; typed here so they always exist.
+        self._last_update_record: UpdateRecord | None = None
+        self._preserved_docs_dir: str | None = None
+        self.config = config
+        self.verbose = verbose
+        self.generate_html = generate_html
+        self.commit_id = commit_id
+        self.progress_tracker = ProgressTracker(total_stages=5, verbose=verbose)
+        self.job = DocumentationJob()
+
+        # Setup job metadata
+        self.job.repository_path = str(repo_path)
+        self.job.repository_name = repo_path.name
+        self.job.output_directory = str(output_dir)
+        self.job.llm_config = LLMConfig(
+            main_model=config.get("main_model", ""),
+            cluster_model=config.get("cluster_model", ""),
+            base_url=config.get("base_url", ""),
+        )
+
+        # Configure backend logging
+        self._configure_backend_logging()
+
+    def _configure_backend_logging(self):
+        """Configure backend logger for CLI use with colored output."""
+        from codewiki.src.be.dependency_analyzer.utils.logging_config import ColoredFormatter
+
+        # Get backend logger (parent of all backend modules)
+        backend_logger = logging.getLogger("codewiki.src.be")
+
+        # Remove existing handlers to avoid duplicates
+        backend_logger.handlers.clear()
+
+        if self.verbose:
+            # In verbose mode, show INFO and above
+            backend_logger.setLevel(logging.INFO)
+
+            # Create console handler with formatting
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+
+            # Use colored formatter for better readability
+            colored_formatter = ColoredFormatter()
+            console_handler.setFormatter(colored_formatter)
+
+            # Add handler to logger
+            backend_logger.addHandler(console_handler)
+        else:
+            # In non-verbose mode, suppress backend logs (use WARNING level to hide INFO/DEBUG)
+            backend_logger.setLevel(logging.WARNING)
+
+            # Create console handler for warnings and errors only
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setLevel(logging.WARNING)
+
+            # Use colored formatter even for warnings/errors
+            colored_formatter = ColoredFormatter()
+            console_handler.setFormatter(colored_formatter)
+
+            backend_logger.addHandler(console_handler)
+
+        # Prevent propagation to root logger to avoid duplicate messages
+        backend_logger.propagate = False
+
+    def generate(self) -> DocumentationJob:
+        """Generate documentation with progress and terminal timing traces."""
+        set_cli_context(True)
+        # Resolved from --trace/--no-trace or the persistent configuration.
+        set_trace_setting(self.config.get("trace", True) is not False)
+        with generation_trace():
+            return self._generate()
+
+    def _generate(self) -> DocumentationJob:
+        """
+        Generate documentation with progress tracking.
+
+        Returns:
+            Completed DocumentationJob
+
+        Raises:
+            APIError: If LLM API call fails
+        """
+        self.job.start()
+
+        try:
+            # Set CLI context for backend
+            set_cli_context(True)
+
+            # Create backend config with CLI settings
+            backend_config = BackendConfig.from_cli(
+                repo_path=str(self.repo_path),
+                output_dir=str(self.output_dir),
+                llm_base_url=self.config.get("base_url") or "",
+                llm_api_key=self.config.get("api_key") or "",
+                main_model=self.config.get("main_model") or "",
+                cluster_model=self.config.get("cluster_model") or "",
+                fallback_model=self.config.get("fallback_model") or "",
+                provider=self.config.get("provider", "openai-compatible"),
+                aws_region=self.config.get("aws_region", "us-east-1"),
+                max_tokens=self.config.get("max_tokens", 32768),
+                max_token_per_module=self.config.get("max_token_per_module", 36369),
+                max_token_per_leaf_module=self.config.get("max_token_per_leaf_module", 16000),
+                max_leaf_nodes_per_cluster=self.config.get("max_leaf_nodes_per_cluster", 600),
+                max_depth=self.config.get("max_depth", MAX_DEPTH),
+                request_limit=self.config.get("request_limit", 100),
+                agent_retries=self.config.get("agent_retries", 3),
+                concurrency=self.config.get("concurrency", 2),
+                agent_instructions=self.config.get("agent_instructions"),
+                use_gitignore=self.config.get("use_gitignore", True),
+                prompt_caching=self.config.get("prompt_caching", True),
+                trace=self.config.get("trace", True),
+                artifacts_enabled=self.config.get("artifacts_enabled", True),
+                artifact_token_budget=self.config.get("artifact_token_budget", 200_000),
+                with_prose=self.config.get("with_prose", False),
+                layout=self.config.get("layout", DEFAULT_LAYOUT),
+            )
+
+            # Run backend documentation generation
+            asyncio.run(self._run_backend_generation(backend_config))
+
+            # Stage 4: HTML Generation (optional)
+            if self.generate_html:
+                self._run_html_generation()
+
+            # Stage 5: Finalization (metadata already created by backend)
+            self._finalize_job()
+
+            # Complete job
+            self.job.complete()
+
+            return self.job
+
+        except APIError as e:
+            self.job.fail(str(e))
+            raise
+        except Exception as e:
+            self.job.fail(str(e))
+            raise
+
+    async def _run_backend_generation(self, backend_config: BackendConfig):
+        """Run the backend documentation generation with progress tracking."""
+
+        # Stage 1: Dependency Analysis
+        self.progress_tracker.start_stage(1, "Dependency Analysis")
+        if self.verbose:
+            self.progress_tracker.update_stage(0.2, "Initializing dependency analyzer...")
+
+        # Create documentation generator
+        doc_generator = DocumentationGenerator(backend_config, commit_id=self.commit_id)
+        if self.config.get("full_regenerate"):
+            self._move_docs_aside()
+
+        # Incremental update (component-level): keep the previous graph before
+        # the builder overwrites it, so the updater can diff old against new.
+        update_opts = self._update_options()
+        prev_graph_path = None
+        if update_opts is not None:
+            from codewiki.src.be.updater.graph_store import snapshot_old_graph
+
+            prev_graph_path = snapshot_old_graph(
+                backend_config.dependency_graph_dir, str(self.repo_path)
+            )
+
+        if self.verbose:
+            self.progress_tracker.update_stage(0.5, "Parsing source files...")
+
+        # Build dependency graph
+        try:
+            with trace_span("dependency_analysis"):
+                components, leaf_nodes = doc_generator.graph_builder.build_dependency_graph()
+            self.job.statistics.total_files_analyzed = len(components)
+            self.job.statistics.leaf_nodes = len(leaf_nodes)
+
+            if self.verbose:
+                self.progress_tracker.update_stage(
+                    0.8, f"Analyzed {len(components)} files, found {len(leaf_nodes)} leaf nodes"
+                )
+                # Log individual files analyzed
+                for comp_name in sorted(components.keys())[:20]:
+                    self.progress_tracker.update_stage(0.9, f"  File: {comp_name}")
+                if len(components) > 20:
+                    self.progress_tracker.update_stage(
+                        0.9, f"  ... and {len(components) - 20} more files"
+                    )
+        except Exception as e:  # noqa: BLE001 — surfaced to the user as an APIError
+            raise APIError(f"Dependency analysis failed: {e}")
+
+        self.progress_tracker.complete_stage()
+
+        if update_opts is not None:
+            outcome = await self._run_incremental_update(
+                backend_config, doc_generator, update_opts, prev_graph_path, components, leaf_nodes
+            )
+            if outcome in ("incremental", "no_change"):
+                # The builder wrote the new graph under this checkout's name. Drop graphs
+                # left by earlier checkouts so the next update has exactly one to pick.
+                from codewiki.src.be.updater.graph_store import (
+                    graph_file_path,
+                    prune_superseded_graphs,
+                )
+
+                prune_superseded_graphs(
+                    backend_config.dependency_graph_dir,
+                    keep=graph_file_path(backend_config.dependency_graph_dir, str(self.repo_path)),
+                )
+                return
+            # full_fallback / detector_failure: preserve the old docs, rebuild from scratch
+            self._move_docs_aside()
+            with trace_span("dependency_analysis"):
+                components, leaf_nodes = doc_generator.graph_builder.build_dependency_graph()
+
+        # Stage 2: Module Clustering
+        self.progress_tracker.start_stage(2, "Module Clustering")
+        if self.verbose:
+            self.progress_tracker.update_stage(0.5, "Clustering modules with LLM...")
+
+        from codewiki.src.be.cluster_modules import get_clustering_input_token_count
+        from codewiki.src.be.business_clustering import (
+            cluster_business_modules,
+            select_business_components,
+        )
+
+        leaf_nodes = select_business_components(leaf_nodes, components)
+        doc_generator.business_analysis = True
+        from codewiki.src.config import FIRST_MODULE_TREE_FILENAME, MODULE_TREE_FILENAME
+        from codewiki.src.utils import file_manager
+
+        working_dir = str(self.output_dir.absolute())
+        file_manager.ensure_directory(working_dir)
+        first_module_tree_path = os.path.join(working_dir, FIRST_MODULE_TREE_FILENAME)
+        module_tree_path = os.path.join(working_dir, MODULE_TREE_FILENAME)
+
+        try:
+            if os.path.exists(first_module_tree_path):
+                with trace_span("clustering"):
+                    mark_skipped("复用已有模块树")
+                    module_tree = file_manager.load_json(first_module_tree_path) or {}
+                # Never clobber an existing module_tree.json with the cached
+                # first tree: it carries sub-modules inserted by agents in
+                # earlier (resumed) runs, and those modules short-circuit on
+                # their existing .md without re-inserting their children.
+                if not os.path.exists(module_tree_path):
+                    file_manager.save_json(module_tree, module_tree_path)
+                if self.verbose:
+                    self.progress_tracker.update_stage(0.5, "Loaded cached module tree")
+            else:
+                if self.verbose:
+                    clustering_tokens = get_clustering_input_token_count(leaf_nodes, components)
+                    self.progress_tracker.update_stage(
+                        0.3,
+                        (
+                            f"Preparing {len(leaf_nodes)} leaf nodes for clustering "
+                            f"({clustering_tokens} tokens, threshold "
+                            f"{backend_config.max_token_per_module})"
+                        ),
+                    )
+                    if clustering_tokens <= backend_config.max_token_per_module:
+                        self.progress_tracker.update_stage(
+                            0.4,
+                            "Skipping LLM clustering; selected leaf nodes fit within the module token threshold",
+                        )
+                    else:
+                        self.progress_tracker.update_stage(
+                            0.4,
+                            "Clustering modules with LLM...",
+                        )
+                cluster_model = backend_config.cluster_model or None
+                with trace_span("clustering"):
+                    module_tree = cluster_business_modules(
+                        leaf_nodes,
+                        components,
+                        backend_config,
+                        completer=lambda p: doc_generator.backend.complete(p, model=cluster_model),
+                    )
+                # Only freshly clustered trees are deduped: renaming a cached
+                # key whose .md already exists would orphan the doc.
+                from codewiki.src.be.module_naming import dedupe_module_tree_names
+
+                module_tree = dedupe_module_tree_names(module_tree)
+                file_manager.save_json(module_tree, first_module_tree_path)
+                file_manager.save_json(module_tree, module_tree_path)
+
+            self.job.module_count = len(module_tree)
+
+            if self.verbose:
+                if len(module_tree) == 0:
+                    self.progress_tracker.update_stage(
+                        1.0,
+                        "Created 0 modules; continuing in whole-repository documentation mode",
+                    )
+                else:
+                    self.progress_tracker.update_stage(
+                        1.0,
+                        f"Created {len(module_tree)} modules",
+                    )
+                for mod_name in sorted(module_tree.keys()):
+                    file_count = (
+                        len(module_tree[mod_name])
+                        if isinstance(module_tree[mod_name], list)
+                        else "?"
+                    )
+                    self.progress_tracker.update_stage(
+                        1.0, f"  Module: {mod_name} ({file_count} files)"
+                    )
+        except Exception as e:  # noqa: BLE001 — surfaced to the user as an APIError
+            raise APIError(f"Module clustering failed: {e}")
+
+        self.progress_tracker.complete_stage()
+
+        # Stage 3: Documentation Generation
+        self.progress_tracker.start_stage(3, "Documentation Generation")
+        if self.verbose:
+            self.progress_tracker.update_stage(0.1, "Generating module documentation...")
+
+        try:
+            if self.verbose:
+                self.progress_tracker.update_stage(
+                    0.2, f"Generating documentation for {self.job.module_count} modules..."
+                )
+
+            # Run the actual documentation generation
+            await doc_generator.generate_module_documentation(components, leaf_nodes)
+
+            if self.verbose:
+                self.progress_tracker.update_stage(0.9, "Creating repository overview...")
+
+            # Create metadata
+            with trace_span("metadata"):
+                prior_history = self._read_update_history(working_dir)
+                metadata_options = {}
+                if self.config.get("update") and not getattr(self, "_preserved_docs_dir", None):
+                    from codewiki.src.prompt_assets import detect_prompt_change
+
+                    change = detect_prompt_change(str(self.repo_path), working_dir)
+                    metadata_options["prompt_asset_hash"] = (
+                        change.stored if change.status == "changed" else change.current
+                    )
+                doc_generator.create_documentation_metadata(
+                    working_dir, components, len(leaf_nodes), **metadata_options
+                )
+                self._merge_update_summary(working_dir, prior_history)
+
+            # Collect generated files
+            self.job.files_generated.extend(_generated_files(working_dir))
+
+        except Exception as e:  # noqa: BLE001 — surfaced to the user as an APIError
+            raise APIError(f"Documentation generation failed: {e}")
+
+        # Reconcile the final module tree against the docs on disk so name
+        # collisions or failed sub-agents can't pass as success (issue #76).
+        # Outside the try/except above so it is not reported as an API error.
+        with trace_span("validation"):
+            missing_docs = doc_generator.validate_generated_docs(working_dir)
+            if missing_docs:
+                raise IncompleteGenerationError(
+                    "Documentation generation finished but these module docs are missing: "
+                    + ", ".join(f"{name}.md" for name in missing_docs),
+                    missing_modules=missing_docs,
+                )
+
+        self.progress_tracker.complete_stage()
+
+    # ------------------------------------------------------------------
+    # Incremental update helpers
+    # ------------------------------------------------------------------
+
+    def _update_options(self):
+        """Return ``UpdateOptions`` when this run is a component-level update, else None."""
+        if not self.config.get("update"):
+            return None
+        raw = dict(self.config.get("update_options") or {})
+        rung = str(raw.pop("rung", "3") or "3")
+        if rung == "0":
+            return None  # legacy path handled in generate.py
+        if not (self.output_dir / "module_tree.json").exists():
+            return None  # nothing to update against: normal generation
+        from codewiki.src.be.updater.options import UpdateOptions
+
+        return UpdateOptions.from_rung(rung, **raw)
+
+    @traced("incremental_update")
+    async def _run_incremental_update(
+        self, backend_config, doc_generator, update_opts, prev_graph_path, components, leaf_nodes
+    ) -> str:
+        import json
+
+        from codewiki.src.be.updater.orchestrator import IncrementalUpdater
+
+        # The updater rewrites pages through the same module agents as init.
+        # The update path never runs the init entry point that sets this flag,
+        # so set it here too — otherwise regenerated pages lose the business
+        # rules (topic purpose, ownership, evidence discipline) that the rest
+        # of the wiki was built with.
+        doc_generator.business_analysis = True
+        doc_generator.backend.business_analysis = True
+
+        self.progress_tracker.start_stage(2, "Incremental Update")
+        prev_commit = None
+        try:
+            with open(self.output_dir / "metadata.json", encoding="utf-8") as f:
+                prev_commit = (json.load(f).get("generation_info") or {}).get("commit_id")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        revision = {
+            "old_commit": prev_commit,
+            "new_commit": self.commit_id,
+            "repo_path": str(self.repo_path),
+        }
+        updater = IncrementalUpdater(
+            backend_config, doc_generator.backend, doc_generator, update_opts
+        )
+        if self.config.get("prompt_asset_change"):
+            updater.record.prompt_asset_change = dict(self.config["prompt_asset_change"])
+        record = await updater.run(prev_graph_path, components, leaf_nodes, revision)
+        self._last_update_record = record
+        summary = record.summary()
+        if self.verbose:
+            self.progress_tracker.update_stage(
+                0.9,
+                f"Update outcome: {record.outcome} (diff {summary['diff_counts']}, "
+                f"{summary['n_active']} active leaves, {summary['n_calls']} LLM calls)",
+            )
+        working_dir = str(self.output_dir.absolute())
+        if record.outcome in ("incremental", "no_change"):
+            # A convention change is only baselined by a full rebuild: keep the
+            # stored fingerprint while the team file differs, so the next
+            # update warns again until the docs are regenerated from scratch.
+            from codewiki.src.prompt_assets import detect_prompt_change
+
+            change = detect_prompt_change(str(self.repo_path), working_dir)
+            keep_hash = change.stored if change.status == "changed" else change.current
+            # create_documentation_metadata rewrites metadata.json from scratch;
+            # keep the history of earlier updates so a chain of updates accumulates.
+            prior_history = self._read_update_history(working_dir)
+            doc_generator.create_documentation_metadata(
+                working_dir, components, len(leaf_nodes), prompt_asset_hash=keep_hash
+            )
+            self._merge_update_summary(working_dir, prior_history)
+            self.job.files_generated.extend(_generated_files(working_dir))
+            tree_path = os.path.join(working_dir, "module_tree.json")
+            if os.path.exists(tree_path):
+                with open(tree_path, encoding="utf-8") as f:
+                    self.job.module_count = len(json.load(f))
+            missing_docs = doc_generator.validate_generated_docs(working_dir)
+            if missing_docs:
+                raise IncompleteGenerationError(
+                    "Incremental update finished but these module docs are missing: "
+                    + ", ".join(f"{name}.md" for name in missing_docs),
+                    missing_modules=missing_docs,
+                )
+        self.progress_tracker.complete_stage()
+        return record.outcome
+
+    def _move_docs_aside(self) -> None:
+        """Back up previous docs without moving shared repository assets."""
+        from codewiki.src.be.doc_layout import preserve_generated_docs
+
+        target = preserve_generated_docs(self.repo_path, self.output_dir, self.commit_id)
+        self._preserved_docs_dir = str(target)
+        record = getattr(self, "_last_update_record", None)
+        if record is not None:
+            record.detector_notes.append(f"previous docs moved to {target}")
+        if self.verbose:
+            self.progress_tracker.update_stage(0.1, f"Previous docs preserved at {target}")
+
+    @staticmethod
+    def _read_update_history(working_dir: str) -> list:
+        path = os.path.join(working_dir, "metadata.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                history = (json.load(f) or {}).get("update_history")
+        except (OSError, json.JSONDecodeError):
+            return []
+        return history if isinstance(history, list) else []
+
+    def _merge_update_summary(self, working_dir: str, prior_history: list | None = None) -> None:
+        from codewiki.src.be.updater.record import UpdateRecord, merge_into_metadata
+        import time
+
+        record = getattr(self, "_last_update_record", None)
+        change = self.config.get("prompt_asset_change") or {}
+        preserved = getattr(self, "_preserved_docs_dir", None)
+        if record is None and change:
+            record = UpdateRecord(
+                outcome="full" if preserved else "incremental",
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                options=dict(self.config.get("update_options") or {}),
+                revision={"new_commit": self.commit_id, "repo_path": str(self.repo_path)},
+            )
+            self._last_update_record = record
+        if record is None:
+            return
+        if change:
+            record.prompt_asset_change = {
+                **change,
+                "execution": "full" if preserved else record.outcome,
+            }
+        summary = record.summary()
+        if preserved:
+            summary["previous_docs"] = preserved
+        merge_into_metadata(working_dir, summary, prior_history=prior_history)
+        try:
+            record.save(working_dir)
+        except OSError:
+            pass
+
+    @traced("html_generation")
+    def _run_html_generation(self):
+        """Run HTML generation stage."""
+        self.progress_tracker.start_stage(4, "HTML Generation")
+
+        from codewiki.cli.html_generator import HTMLGenerator
+
+        # Generate HTML
+        html_generator = HTMLGenerator()
+
+        if self.verbose:
+            self.progress_tracker.update_stage(0.3, "Loading module tree and metadata...")
+
+        repo_info = html_generator.detect_repository_info(self.repo_path)
+
+        # Generate HTML with auto-loading of module_tree and metadata from docs_dir
+        output_path = self.output_dir / "index.html"
+        html_generator.generate(
+            output_path=output_path,
+            title=repo_info["name"] or "",
+            repository_url=repo_info["url"],
+            github_pages_url=repo_info["github_pages_url"],
+            docs_dir=self.output_dir,  # Auto-load module_tree and metadata from here
+        )
+
+        self.job.files_generated.append("index.html")
+
+        if self.verbose:
+            self.progress_tracker.update_stage(1.0, "Generated index.html")
+
+        self.progress_tracker.complete_stage()
+
+    @traced("finalization")
+    def _finalize_job(self):
+        """Finalize the job (metadata already created by backend)."""
+        # Just verify metadata exists
+        metadata_path = self.output_dir / "metadata.json"
+        if not metadata_path.exists():
+            # Create our own if backend didn't
+            with open(metadata_path, "w") as f:
+                f.write(self.job.to_json())

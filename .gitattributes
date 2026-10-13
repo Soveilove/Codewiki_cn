@@ -1,0 +1,16 @@
+# 统一行尾规则：所有文本文件库内与检出均为 LF。
+# 消除 Windows 上 core.autocrlf=true 造成的 LF/CRLF 反复转换警告，
+# 并保证跨平台 clone 得到一致内容。
+* text=auto eol=lf
+
+# 二进制文件显式声明，不做任何转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

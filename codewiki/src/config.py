@@ -1,0 +1,365 @@
+# pyright: reportConstantRedefinition=none
+# _CLI_CONTEXT / _TRACE_ENABLED are module-level mutable process state, not
+# constants: they are flipped by set_cli_context/set_trace_setting (and read
+# directly by tests). Their name is part of that contract.
+import argparse
+import os
+from dataclasses import dataclass
+from typing import Any
+
+from dotenv import load_dotenv
+
+from codewiki.src.language import format_language_directive, normalize_language
+
+load_dotenv()
+
+# Constants
+OUTPUT_BASE_DIR = "output"
+DEPENDENCY_GRAPHS_DIR = "dependency_graphs"
+DOCS_DIR = "docs"
+DEFAULT_OUTPUT_DIR = ".codewiki"
+FIRST_MODULE_TREE_FILENAME = "first_module_tree.json"
+MODULE_TREE_FILENAME = "module_tree.json"
+OVERVIEW_FILENAME = "overview.md"
+# Docs layout: "hierarchical" mirrors the module tree in nested folders
+# (``auth.md`` + ``auth/login.md``); "flat" keeps every page in the docs root
+# (for small models that keep getting relative links wrong).
+LAYOUT_HIERARCHICAL = "hierarchical"
+LAYOUT_FLAT = "flat"
+DEFAULT_LAYOUT = LAYOUT_HIERARCHICAL
+MAX_DEPTH = 2
+# Default max token settings
+DEFAULT_MAX_TOKENS = 32_768
+DEFAULT_MAX_TOKEN_PER_MODULE = 36_369
+DEFAULT_MAX_TOKEN_PER_LEAF_MODULE = 4_000
+# pydantic-ai caps each agent run at 50 model requests by default; complex
+# modules that read many components and delegate sub-modules can need more.
+DEFAULT_REQUEST_LIMIT = 100
+# pydantic-ai retries a failing tool call (and output validation) once by default.
+DEFAULT_AGENT_RETRIES = 3
+# Super-group the flat top level into architectural subsystems only when it
+# has more than this many modules; 0 or negative disables the pass.
+DEFAULT_MIN_MODULES_FOR_SUPER_GROUPING = 3
+# A single clustering call must re-emit every component ID in its output, so
+# huge inputs are partitioned by directory structure into batches of at most
+# this many leaf nodes (and further bounded by an output-token budget derived
+# from max_tokens).
+DEFAULT_MAX_LEAF_NODES_PER_CLUSTER = 600
+# Upper bound on how many component references ONE business-planning call may be
+# asked to assign. Each call must emit a JSON entry per reference, so a few
+# hundred references make models lose the mapping and either stop mid-object,
+# repeat references, or skip items. Input size is bounded separately by
+# max_token_per_module.
+DEFAULT_MAX_PLANNING_REFS = 80
+# Artifact-aware generation: total token budget for build/CI/container/
+# manifest/config file contents added to the dependency graph.
+DEFAULT_ARTIFACT_TOKEN_BUDGET = 200_000
+# Legacy constants (for backward compatibility)
+MAX_TOKEN_PER_MODULE = DEFAULT_MAX_TOKEN_PER_MODULE
+MAX_TOKEN_PER_LEAF_MODULE = DEFAULT_MAX_TOKEN_PER_LEAF_MODULE
+
+# CLI context detection
+_CLI_CONTEXT = False
+# Resolved once from --trace/--no-trace or the persistent configuration
+_TRACE_ENABLED = True
+
+
+def set_cli_context(enabled: bool = True):
+    """Set whether we're running in CLI context (vs web app)."""
+    global _CLI_CONTEXT
+    _CLI_CONTEXT = enabled
+
+
+def is_cli_context() -> bool:
+    """Check if running in CLI context."""
+    return _CLI_CONTEXT
+
+
+def set_trace_setting(enabled: bool) -> None:
+    """Record the resolved ``--trace``/``--no-trace`` choice for this process."""
+    global _TRACE_ENABLED
+    _TRACE_ENABLED = enabled
+
+
+def trace_setting() -> bool:
+    """Stage timing default for CLI runs (enabled unless disabled)."""
+    return _TRACE_ENABLED
+
+
+# LLM services
+# In CLI mode, these will be loaded from ~/.codewiki/config.json + keyring
+# In web app mode, use environment variables
+MAIN_MODEL = os.getenv("MAIN_MODEL", "claude-sonnet-4")
+FALLBACK_MODEL_1 = os.getenv("FALLBACK_MODEL_1", "glm-4p5")
+CLUSTER_MODEL = os.getenv("CLUSTER_MODEL", MAIN_MODEL)
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://0.0.0.0:4000/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-1234")
+
+# Atlas Cloud default endpoint (OpenAI-compatible). Used to auto-fill the base URL
+# when the user selects the `atlas-cloud` provider without passing --base-url.
+ATLAS_CLOUD_BASE_URL = "https://api.atlascloud.ai/v1"
+
+
+@dataclass
+class Config:
+    """Configuration class for CodeWiki."""
+
+    repo_path: str
+    output_dir: str
+    dependency_graph_dir: str
+    docs_dir: str
+    max_depth: int
+    # LLM configuration
+    llm_base_url: str
+    llm_api_key: str
+    main_model: str
+    cluster_model: str
+    fallback_model: str = FALLBACK_MODEL_1
+    # Provider configuration
+    provider: str = (
+        "openai-compatible"  # openai-compatible, atlas-cloud, anthropic, bedrock, azure-openai
+    )
+    aws_region: str = "us-east-1"
+    api_version: str = "2024-12-01-preview"  # Azure OpenAI API version
+    azure_deployment: str = ""  # Azure OpenAI deployment name
+    # Max token settings
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    max_token_per_module: int = DEFAULT_MAX_TOKEN_PER_MODULE
+    max_token_per_leaf_module: int = DEFAULT_MAX_TOKEN_PER_LEAF_MODULE
+    min_modules_for_super_grouping: int = DEFAULT_MIN_MODULES_FOR_SUPER_GROUPING
+    max_leaf_nodes_per_cluster: int = DEFAULT_MAX_LEAF_NODES_PER_CLUSTER
+    max_planning_refs_per_call: int = DEFAULT_MAX_PLANNING_REFS
+    # Agent run limits (model requests per run, retries per failing tool call)
+    request_limit: int = DEFAULT_REQUEST_LIMIT
+    agent_retries: int = DEFAULT_AGENT_RETRIES
+    concurrency: int = 2
+    # Prompt caching for agentic/multi-turn calls (auto-disables per model if
+    # the provider rejects cache_control markers)
+    prompt_caching: bool = True
+    # Agent instructions for customization
+    agent_instructions: dict[str, Any] | None = None
+    # Stage/phase timing trace printed for CLI runs
+    trace: bool = True
+    # Apply Git ignore rules before dependency analysis
+    use_gitignore: bool = True
+    # Artifact-aware generation (Dockerfiles, CI workflows, Makefiles,
+    # manifests, config, schemas, scripts become `artifact` graph nodes)
+    artifacts_enabled: bool = True
+    artifact_token_budget: int = DEFAULT_ARTIFACT_TOKEN_BUDGET
+    # Also read the root README and docs/ as a `prose` artifact class (off by
+    # default: documentation without existing prose is the benchmark setting)
+    with_prose: bool = False
+    # Docs layout (LAYOUT_HIERARCHICAL or LAYOUT_FLAT)
+    layout: str = DEFAULT_LAYOUT
+
+    @property
+    def artifact_exclude(self) -> list[str] | None:
+        """Extra patterns excluded from artifact analysis (from agent instructions)."""
+        if self.agent_instructions:
+            return self.agent_instructions.get("artifact_exclude")
+        return None
+
+    @property
+    def include_patterns(self) -> list[str] | None:
+        """Get file include patterns from agent instructions."""
+        if self.agent_instructions:
+            return self.agent_instructions.get("include_patterns")
+        return None
+
+    @property
+    def exclude_patterns(self) -> list[str] | None:
+        """Get file exclude patterns from agent instructions."""
+        if self.agent_instructions:
+            return self.agent_instructions.get("exclude_patterns")
+        return None
+
+    @property
+    def focus_modules(self) -> list[str] | None:
+        """Get focus modules from agent instructions."""
+        if self.agent_instructions:
+            return self.agent_instructions.get("focus_modules")
+        return None
+
+    @property
+    def doc_type(self) -> str | None:
+        """Get documentation type from agent instructions."""
+        if self.agent_instructions:
+            return self.agent_instructions.get("doc_type")
+        return None
+
+    @property
+    def custom_instructions(self) -> str | None:
+        """Get custom instructions from agent instructions."""
+        if self.agent_instructions:
+            return self.agent_instructions.get("custom_instructions")
+        return None
+
+    @property
+    def language(self) -> str | None:
+        """Output language of the generated docs (None means English)."""
+        if self.agent_instructions:
+            return normalize_language(self.agent_instructions.get("language"))
+        return None
+
+    def get_prompt_addition(self) -> str:
+        """Generate prompt additions based on agent instructions."""
+        if not self.agent_instructions:
+            return ""
+
+        additions = []
+
+        # First, so it is not outweighed by the English prompts around it
+        if self.language:
+            additions.append(format_language_directive(self.language))
+
+        if self.doc_type:
+            doc_type_instructions = {
+                "api": "Focus on API documentation: endpoints, parameters, return types, and usage examples.",
+                "architecture": "Focus on architecture documentation: system design, component relationships, and data flow.",
+                "user-guide": "Focus on user guide documentation: how to use features, step-by-step tutorials.",
+                "developer": "Focus on developer documentation: code structure, contribution guidelines, and implementation details.",
+            }
+            if self.doc_type.lower() in doc_type_instructions:
+                additions.append(doc_type_instructions[self.doc_type.lower()])
+            else:
+                additions.append(f"Focus on generating {self.doc_type} documentation.")
+
+        if self.focus_modules:
+            additions.append(
+                f"Pay special attention to and provide more detailed documentation for these modules: {', '.join(self.focus_modules)}"
+            )
+
+        if self.custom_instructions:
+            additions.append(f"Additional instructions: {self.custom_instructions}")
+
+        return "\n".join(additions) if additions else ""
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "Config":
+        """Create configuration from parsed arguments."""
+        repo_name = os.path.basename(os.path.normpath(args.repo_path))
+        sanitized_repo_name = "".join(c if c.isalnum() else "_" for c in repo_name)
+
+        return cls(
+            repo_path=args.repo_path,
+            output_dir=OUTPUT_BASE_DIR,
+            dependency_graph_dir=os.path.join(OUTPUT_BASE_DIR, DEPENDENCY_GRAPHS_DIR),
+            docs_dir=os.path.join(OUTPUT_BASE_DIR, DOCS_DIR, f"{sanitized_repo_name}-docs"),
+            max_depth=MAX_DEPTH,
+            llm_base_url=LLM_BASE_URL,
+            llm_api_key=LLM_API_KEY,
+            main_model=MAIN_MODEL,
+            cluster_model=CLUSTER_MODEL,
+            fallback_model=FALLBACK_MODEL_1,
+            use_gitignore=getattr(args, "use_gitignore", True),
+            layout=getattr(args, "layout", DEFAULT_LAYOUT),
+        )
+
+    @classmethod
+    def from_cli(
+        cls,
+        repo_path: str,
+        output_dir: str,
+        llm_base_url: str,
+        llm_api_key: str,
+        main_model: str,
+        cluster_model: str,
+        fallback_model: str = FALLBACK_MODEL_1,
+        provider: str = "openai-compatible",
+        aws_region: str = "us-east-1",
+        api_version: str = "2024-12-01-preview",
+        azure_deployment: str = "",
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_token_per_module: int = DEFAULT_MAX_TOKEN_PER_MODULE,
+        max_token_per_leaf_module: int = DEFAULT_MAX_TOKEN_PER_LEAF_MODULE,
+        min_modules_for_super_grouping: int = DEFAULT_MIN_MODULES_FOR_SUPER_GROUPING,
+        max_leaf_nodes_per_cluster: int = DEFAULT_MAX_LEAF_NODES_PER_CLUSTER,
+        max_planning_refs_per_call: int = DEFAULT_MAX_PLANNING_REFS,
+        max_depth: int = MAX_DEPTH,
+        request_limit: int = DEFAULT_REQUEST_LIMIT,
+        agent_retries: int = DEFAULT_AGENT_RETRIES,
+        agent_instructions: dict[str, Any] | None = None,
+        use_gitignore: bool = True,
+        prompt_caching: bool = True,
+        trace: bool = True,
+        artifacts_enabled: bool = True,
+        artifact_token_budget: int = DEFAULT_ARTIFACT_TOKEN_BUDGET,
+        with_prose: bool = False,
+        layout: str = DEFAULT_LAYOUT,
+        concurrency: int = 2,
+    ) -> "Config":
+        """
+        Create configuration for CLI context.
+
+        Args:
+            repo_path: Repository path
+            output_dir: Output directory for generated docs
+            llm_base_url: LLM API base URL
+            llm_api_key: LLM API key
+            main_model: Primary model
+            cluster_model: Clustering model
+            fallback_model: Fallback model
+            provider: LLM provider type (openai-compatible, atlas-cloud, anthropic, bedrock, azure-openai)
+            aws_region: AWS region for Bedrock provider
+            api_version: Azure OpenAI API version
+            azure_deployment: Azure OpenAI deployment name
+            max_tokens: Maximum tokens for LLM response
+            max_token_per_module: Maximum tokens per module for clustering
+            max_token_per_leaf_module: Maximum tokens per leaf module
+            min_modules_for_super_grouping: Super-group the top level into
+                subsystems only when it has more than this many modules
+                (0 or negative disables the pass)
+            max_leaf_nodes_per_cluster: Partition clustering inputs into
+                structure-based batches of at most this many leaf nodes
+            max_planning_refs_per_call: Maximum component references one
+                business-planning call must assign in a single response
+            max_depth: Maximum depth for hierarchical decomposition
+            request_limit: Maximum model requests per agent run
+            agent_retries: Retries for a failing tool call or output validation
+            agent_instructions: Custom agent instructions dict
+            use_gitignore: Whether to apply Git ignore rules
+            prompt_caching: Whether to add prompt-cache breakpoints to agentic calls
+            artifacts_enabled: Add build/CI/container/manifest/config files to
+                the dependency graph and document them
+            artifact_token_budget: Total token budget for artifact file contents
+            with_prose: Also read README and docs/ as a `prose` artifact class
+            layout: Docs layout, "hierarchical" (nested folders) or "flat"
+
+        Returns:
+            Config instance
+        """
+        base_output_dir = os.path.join(output_dir, "temp")
+
+        return cls(
+            repo_path=repo_path,
+            output_dir=base_output_dir,
+            dependency_graph_dir=os.path.join(base_output_dir, DEPENDENCY_GRAPHS_DIR),
+            docs_dir=output_dir,
+            max_depth=max_depth,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            main_model=main_model,
+            cluster_model=cluster_model,
+            fallback_model=fallback_model,
+            provider=provider,
+            aws_region=aws_region,
+            api_version=api_version,
+            azure_deployment=azure_deployment,
+            max_tokens=max_tokens,
+            max_token_per_module=max_token_per_module,
+            max_token_per_leaf_module=max_token_per_leaf_module,
+            min_modules_for_super_grouping=min_modules_for_super_grouping,
+            max_leaf_nodes_per_cluster=max_leaf_nodes_per_cluster,
+            max_planning_refs_per_call=max_planning_refs_per_call,
+            request_limit=request_limit,
+            agent_retries=agent_retries,
+            agent_instructions=agent_instructions,
+            use_gitignore=use_gitignore,
+            prompt_caching=prompt_caching,
+            trace=trace,
+            artifacts_enabled=artifacts_enabled,
+            artifact_token_budget=artifact_token_budget,
+            with_prose=with_prose,
+            layout=layout,
+            concurrency=max(1, concurrency),
+        )
