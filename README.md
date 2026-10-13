@@ -15,7 +15,7 @@
   <a href="./LICENSE"><img alt="许可证：MIT" src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" /></a>
   <a href="https://github.com/FSoft-AI4Code/CodeWiki/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/FSoft-AI4Code/CodeWiki/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <a href="https://aclanthology.org/2026.findings-acl.288/"><img alt="论文：ACL 2026 Findings" src="https://img.shields.io/badge/paper-Findings%20of%20ACL%202026-b31b1b?style=flat-square" /></a>
-  <a href="https://github.com/FSoft-AI4Code/CodeWiki/stargazers"><img alt="GitHub 星标数" src="https://img.shields.io/github/stars/FSoft-AI4Code/CodeWiki?style=flat-square" /></a>
+  <a href="https://github.com/Soveilove/Codewiki_cn/stargazers"><img alt="GitHub 星标数" src="https://img.shields.io/github/stars/Soveilove/Codewiki_cn?style=flat-square" /></a>
 </p>
 
 <p align="center">
@@ -36,6 +36,10 @@ https://github.com/user-attachments/assets/951d5d3c-fd6e-4734-8b16-445d880f95d3
 
 CodeWiki 扫描仓库并建立依赖关系图，再按组件职责组织成模块，生成 Markdown 页面和仓库总览。支持 Python、Java、JavaScript、TypeScript、C、C++、C#、Kotlin、PHP、Ruby、Scala 和 Rust。可以连接模型 API、使用 Claude Code / Codex 订阅，或通过支持 MCP 的 IDE 运行。
 
+## 项目来源与改造说明
+
+本仓库基于 [FSoft-AI4Code/CodeWiki](https://github.com/FSoft-AI4Code/CodeWiki) 的 MIT 许可代码持续改造，保留原项目版权与许可声明。此分支重点面向中文业务知识文档生成及团队使用流程，包含中文模块命名、团队提示词与业务规则传递、生成质量控制、增量更新和 MCP 协作等调整；具体功能以本仓库代码和更新日志为准。它是独立维护的派生版本，不代表上游项目或其赞助方。
+
 ## 快速开始
 
 ### 安装
@@ -43,7 +47,7 @@ CodeWiki 扫描仓库并建立依赖关系图，再按组件职责组织成模�
 需要 Python 3.12+、Git。不需要 Node.js 或 npm。
 
 ```bash
-pip install git+https://github.com/FSoft-AI4Code/CodeWiki.git
+pip install git+https://github.com/Soveilove/Codewiki_cn.git
 codewiki --version
 ```
 
@@ -226,24 +230,16 @@ CodeWiki 最初发表于 ACL 2026 Findings 论文 *CodeWiki: Evaluating AI's Abi
 ## GitHub 星标历史
 
 <p align="center">
-  <a href="https://star-history.dera.page/#FSoft-AI4Code/CodeWiki&type=Date">
+  <a href="https://star-history.com/#Soveilove/Codewiki_cn&Date">
    <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=FSoft-AI4Code/CodeWiki&type=Date&theme=dark" />
-     <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=FSoft-AI4Code/CodeWiki&type=Date" />
-     <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=FSoft-AI4Code/CodeWiki&type=Date" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Soveilove/Codewiki_cn&type=Date&theme=dark" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Soveilove/Codewiki_cn&type=Date" />
+     <img alt="Soveilove/Codewiki_cn 星标历史" src="https://api.star-history.com/svg?repos=Soveilove/Codewiki_cn&type=Date" />
    </picture>
   </a>
 </p>
 
-## 赞助方
-
-CodeWiki 由 **FPT Software** 赞助。
-
-<p align="center">
-  <a href="https://fptsoftware.com/en">
-    <img src="./img/fpt-logo.svg" alt="FPT Software" width="220" />
-  </a>
-</p>
+星标历史图由 [Star History](https://star-history.com/) 第三方服务生成；GitHub 原生提供当前星标数，但不提供这种按时间变化的历史曲线。
 
 ## 许可证
 
